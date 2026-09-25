@@ -18,6 +18,13 @@
 约束下，对每条线段 / 每个节点独立选取使其最坏化的峰值负载组合（峰值增量贡献
 降序，贡献相同按负载输入序号升序，零贡献不计入），给出各线段最大承载电流、
 各节点最低电压及相应的越限列表；越限判定与 ``evaluate`` 相同。
+
+``outage_restoration`` 在故障线段断开后评估各候选跨接线：断开故障线段，树分裂为
+source 所在分量（保持供电）与故障线段子节点子树构成的失电分量；候选跨接线须从
+source 所在分量接入失电分量任意节点，失电分量从接入点重新定向（接入点到原子树
+根路径上的线段方向翻转），再重算全树线段电流与节点电压。无越限的候选为可恢复，
+选中可恢复候选中最低节点电压余量（min(节点电压 - 生效阈值)）最大者，平局按输入
+顺序；越限判定与 ``evaluate`` 相同。
 """
 
 from __future__ import annotations
@@ -267,9 +274,8 @@ def _find_violations(tree: _Tree, min_voltage: float) -> tuple[list[dict], list[
     return over_current_segments, under_voltage_nodes
 
 
-def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, loads_in: Sequence) -> dict:
-    """执行压降校核，返回可 JSON 序列化的结果字典。"""
-    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+def _tree_results(tree: _Tree, min_voltage: float) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """生成线段 / 节点明细与越限列表（evaluate 风格，展示值按 6 位小数舍入）。"""
     over_current_segments, under_voltage_nodes = _find_violations(tree, min_voltage)
 
     segment_results = []
@@ -301,6 +307,16 @@ def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, l
                 "under_voltage": voltage < threshold - EPS,
             }
         )
+
+    return segment_results, node_results, over_current_segments, under_voltage_nodes
+
+
+def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, loads_in: Sequence) -> dict:
+    """执行压降校核，返回可 JSON 序列化的结果字典。"""
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+    segment_results, node_results, over_current_segments, under_voltage_nodes = _tree_results(
+        tree, min_voltage
+    )
 
     return {
         "ok": not over_current_segments and not under_voltage_nodes,
@@ -626,4 +642,148 @@ def peak_risk(
         "nodes": node_results,
         "over_current_segments": over_current_segments,
         "under_voltage_nodes": under_voltage_nodes,
+    }
+
+
+def outage_restoration(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    faulty_segment_id: str,
+    jumpers_in: Sequence,
+) -> dict:
+    """断开故障线段后逐候选评估跨接线恢复方案，返回可 JSON 序列化的结果字典。
+
+    断开故障线段后，树分裂为 source 所在分量（保持供电）与故障线段子节点子树
+    构成的失电分量。每条候选跨接线从供电侧节点（须在 source 所在分量）引向
+    失电侧节点（可为失电分量任意节点）；失电分量从接入点重新定向——接入点到
+    原子树根（故障线段子节点）路径上的线段方向翻转，其余线段方向不变——再在
+    恢复后的拓扑上重算全树线段电流与节点电压（故障线段退出运行不计入，跨接线
+    作为新线段计入）。
+
+    越限判定沿用 ``evaluate`` 的额定电流、节点最低允许电压（含节点级覆盖）与
+    EPS 容差规则；无越限的候选为可恢复。从可恢复候选中选中最低节点电压余量
+    （min(节点电压 - 生效阈值)，按未舍入值比较，EPS 内视为平局）最大者，平局
+    按输入顺序；无可恢复方案时选中项为 None。
+    """
+    base = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    faulty = next((seg for seg in base.segments if seg.id == faulty_segment_id), None)
+    if faulty is None:
+        raise InputValidationError("故障线段无效", [f"故障线段 '{faulty_segment_id}' 不存在于树中"])
+
+    # 失电分量：故障线段子节点的子树（断开故障线段后与 source 断开的一侧）
+    lost_nodes: set[str] = set()
+    stack = [faulty.child]
+    while stack:
+        node = stack.pop()
+        lost_nodes.add(node)
+        stack.extend(seg.child for seg in base.children_map.get(node, []))
+
+    # 跨接线校验：id 唯一且不与已有线段重复；供电侧 / 失电侧节点须分别位于两个分量
+    all_nodes = set(base.parent_of) | {ROOT_NODE}
+    existing_ids = {seg.id for seg in base.segments}
+    errors: list[str] = []
+    seen_jumper_ids: set[str] = set()
+    for j in jumpers_in:
+        if j.id in seen_jumper_ids:
+            errors.append(f"跨接线 id 重复: '{j.id}'")
+        seen_jumper_ids.add(j.id)
+        if j.id in existing_ids:
+            errors.append(f"跨接线 id '{j.id}' 与已有线段 id 重复")
+        if j.supply_node not in all_nodes:
+            errors.append(f"跨接线 '{j.id}' 的供电侧节点 '{j.supply_node}' 不存在于树中")
+        elif j.supply_node in lost_nodes:
+            errors.append(
+                f"跨接线 '{j.id}' 的供电侧节点 '{j.supply_node}' 位于失电分量，"
+                f"须位于 '{ROOT_NODE}' 所在分量"
+            )
+        if j.outage_node not in all_nodes:
+            errors.append(f"跨接线 '{j.id}' 的失电侧节点 '{j.outage_node}' 不存在于树中")
+        elif j.outage_node not in lost_nodes:
+            errors.append(
+                f"跨接线 '{j.id}' 的失电侧节点 '{j.outage_node}' 位于 '{ROOT_NODE}' 所在分量，"
+                "须位于失电分量"
+            )
+    if errors:
+        raise InputValidationError("跨接线定义无效", errors)
+
+    seg_by_child = {seg.child: seg for seg in base.segments}
+
+    candidates = []
+    margins: list[float] = []
+    for j in jumpers_in:
+        # 失电分量从接入点重新定向：接入点到原子树根路径上的线段方向翻转
+        flip_seg_ids: set[str] = set()
+        node = j.outage_node
+        while node != faulty.child:
+            seg = seg_by_child[node]
+            flip_seg_ids.add(seg.id)
+            node = seg.parent
+
+        restored: list[Segment] = []
+        for seg in base.segments:
+            if seg.id == faulty_segment_id:
+                continue  # 故障线段断开，退出运行
+            if seg.id in flip_seg_ids:
+                restored.append(
+                    Segment(
+                        id=seg.id,
+                        parent=seg.child,
+                        child=seg.parent,
+                        resistance=seg.resistance,
+                        rated_current=seg.rated_current,
+                    )
+                )
+            else:
+                restored.append(seg)
+        restored.append(
+            Segment(
+                id=j.id,
+                parent=j.supply_node,
+                child=j.outage_node,
+                resistance=j.resistance,
+                rated_current=j.rated_current,
+            )
+        )
+
+        tree = _prepare_tree(source_voltage, restored, loads_in)
+        segment_results, node_results, over_current_segments, under_voltage_nodes = _tree_results(
+            tree, min_voltage
+        )
+
+        margin = min(
+            tree.node_voltage[node] - _node_threshold(tree, node, min_voltage)
+            for node in tree.order
+        )
+        margins.append(margin)
+        candidates.append(
+            {
+                "jumper_id": j.id,
+                "supply_node": j.supply_node,
+                "outage_node": j.outage_node,
+                "restorable": not over_current_segments and not under_voltage_nodes,
+                "min_voltage_margin": _round(margin),
+                "segments": segment_results,
+                "nodes": node_results,
+                "over_current_segments": over_current_segments,
+                "under_voltage_nodes": under_voltage_nodes,
+            }
+        )
+
+    # 可恢复候选中最低节点电压余量最大者（未舍入值比较，EPS 内平局按输入顺序）
+    selected_jumper_id: Optional[str] = None
+    best_margin = 0.0
+    for candidate, margin in zip(candidates, margins):
+        if not candidate["restorable"]:
+            continue
+        if selected_jumper_id is None or margin > best_margin + EPS:
+            selected_jumper_id = candidate["jumper_id"]
+            best_margin = margin
+
+    return {
+        "faulty_segment_id": faulty_segment_id,
+        "candidates": candidates,
+        "selected_jumper_id": selected_jumper_id,
     }

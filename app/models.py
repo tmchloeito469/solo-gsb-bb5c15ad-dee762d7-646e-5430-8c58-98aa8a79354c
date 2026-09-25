@@ -208,3 +208,50 @@ class PeakRiskResponse(BaseModel):
     under_voltage_nodes: list[PeakUnderVoltageViolation] = Field(
         description="最坏情况下欠压的节点"
     )
+
+
+class JumperInput(BaseModel):
+    """一条候选跨接线：自供电侧节点引向失电侧节点。"""
+
+    id: str = Field(min_length=1, description="跨接线标识，须全局唯一（不与已有线段 id 重复）")
+    supply_node: str = Field(min_length=1, description="供电侧节点，须位于 source 所在分量")
+    outage_node: str = Field(min_length=1, description="失电侧节点，可为失电分量任意节点")
+    resistance: float = Field(ge=0, description="跨接线电阻 (Ω)，不允许为负")
+    rated_current: float = Field(gt=0, description="跨接线额定电流 (A)，必须为正")
+
+
+class OutageRestorationRequest(EvaluateRequest):
+    """故障恢复评估请求：在 /evaluate 参数基础上指定故障线段与候选跨接线。"""
+
+    faulty_segment_id: str = Field(min_length=1, description="故障断开的线段标识，须存在于树中")
+    jumpers: list[JumperInput] = Field(description="候选跨接线列表，逐条独立评估（可为空）")
+
+
+class RestorationCandidateResult(BaseModel):
+    jumper_id: str = Field(description="跨接线标识")
+    supply_node: str = Field(description="供电侧节点")
+    outage_node: str = Field(description="失电侧节点（接入点）")
+    restorable: bool = Field(description="恢复后全树无超额定电流且无欠压时为 true")
+    min_voltage_margin: float = Field(
+        description="全树最低节点电压余量 (V)：min(节点电压 - 生效最低允许电压)，"
+        "展示值按 6 位小数舍入"
+    )
+    segments: list[SegmentResult] = Field(
+        description="恢复后全树线段（故障线段退出运行不计入，跨接线列于末尾；"
+        "失电分量内方向翻转的线段以新方向展示）"
+    )
+    nodes: list[NodeResult] = Field(description="恢复后各节点电压（BFS 顺序，根在前）")
+    over_current_segments: list[OverCurrentViolation] = Field(description="恢复后超额定电流的线段")
+    under_voltage_nodes: list[UnderVoltageViolation] = Field(description="恢复后欠压的节点")
+
+
+class OutageRestorationResponse(BaseModel):
+    faulty_segment_id: str = Field(description="故障断开的线段标识")
+    candidates: list[RestorationCandidateResult] = Field(
+        description="各候选跨接线的评估结果（按输入顺序）"
+    )
+    selected_jumper_id: Optional[str] = Field(
+        default=None,
+        description="选中的跨接线 id：可恢复候选中最低节点电压余量最大者（平局按输入顺序）；"
+        "无可恢复方案时为 null",
+    )
