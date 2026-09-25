@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    image: dc-tree-voltage-drop-api
+    container_name: dc-tree-voltage-drop-api
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      PORT: "8000"
+    restart: unless-stopped
+    healthcheck:
+      # 启动时会先安装依赖，预留充足的 start_period
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
