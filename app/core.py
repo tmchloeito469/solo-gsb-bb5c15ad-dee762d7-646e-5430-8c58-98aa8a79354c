@@ -18,6 +18,11 @@
 约束下，对每条线段 / 每个节点独立选取使其最坏化的峰值负载组合（峰值增量贡献
 降序，贡献相同按负载输入序号升序，零贡献不计入），给出各线段最大承载电流、
 各节点最低电压及相应的越限列表；越限判定与 ``evaluate`` 相同。
+
+``outage_restoration`` 断开指定故障线段后，逐条评估候选跨接线：跨接线须连接
+source 所在分量与故障段子节点以下的失电分量，失电分量从接入点重新定向
+（原根到接入点路径上的线段方向反转），重算全树线段电流与节点电压；
+无越限的候选视为可恢复，从中选取最低节点电压余量最大的方案。
 """
 
 from __future__ import annotations
@@ -267,15 +272,12 @@ def _find_violations(tree: _Tree, min_voltage: float) -> tuple[list[dict], list[
     return over_current_segments, under_voltage_nodes
 
 
-def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, loads_in: Sequence) -> dict:
-    """执行压降校核，返回可 JSON 序列化的结果字典。"""
-    tree = _prepare_tree(source_voltage, segments_in, loads_in)
-    over_current_segments, under_voltage_nodes = _find_violations(tree, min_voltage)
-
-    segment_results = []
-    for seg in tree.segments:  # 保持输入顺序
+def _segment_results(tree: _Tree) -> list[dict]:
+    """各线段校核结果（保持输入顺序）。"""
+    results = []
+    for seg in tree.segments:
         current = tree.seg_current[seg.id]
-        segment_results.append(
+        results.append(
             {
                 "segment_id": seg.id,
                 "parent": seg.parent,
@@ -287,12 +289,16 @@ def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, l
                 "over_rated": current > seg.rated_current + EPS,
             }
         )
+    return results
 
-    node_results = []
-    for node in tree.order:  # BFS 顺序，根在前
+
+def _node_results(tree: _Tree, min_voltage: float) -> list[dict]:
+    """各节点校核结果（BFS 顺序，根在前）。"""
+    results = []
+    for node in tree.order:
         threshold = _node_threshold(tree, node, min_voltage)
         voltage = tree.node_voltage[node]
-        node_results.append(
+        results.append(
             {
                 "node": node,
                 "voltage": _round(voltage),
@@ -301,14 +307,21 @@ def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, l
                 "under_voltage": voltage < threshold - EPS,
             }
         )
+    return results
+
+
+def evaluate(source_voltage: float, min_voltage: float, segments_in: Sequence, loads_in: Sequence) -> dict:
+    """执行压降校核，返回可 JSON 序列化的结果字典。"""
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+    over_current_segments, under_voltage_nodes = _find_violations(tree, min_voltage)
 
     return {
         "ok": not over_current_segments and not under_voltage_nodes,
         "source_voltage": source_voltage,
         "min_voltage": min_voltage,
         "total_source_current": _round(tree.node_total[ROOT_NODE]),
-        "segments": segment_results,
-        "nodes": node_results,
+        "segments": _segment_results(tree),
+        "nodes": _node_results(tree, min_voltage),
         "over_current_segments": over_current_segments,
         "under_voltage_nodes": under_voltage_nodes,
     }
@@ -626,4 +639,147 @@ def peak_risk(
         "nodes": node_results,
         "over_current_segments": over_current_segments,
         "under_voltage_nodes": under_voltage_nodes,
+    }
+
+
+def outage_restoration(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    fault_segment_id: str,
+    tie_lines_in: Sequence,
+) -> dict:
+    """评估故障段断开后的候选跨接线恢复方案，返回可 JSON 序列化的结果字典。
+
+    断开故障线段后，配电树分裂为 source 所在分量与故障段子节点以下的失电分量。
+    每条候选跨接线须连接 source 所在分量中的供电侧节点与失电分量中的失电侧节点
+    （可接入失电分量任意节点）；失电分量从接入点重新定向（原根到接入点路径上的
+    线段方向反转，其余保持原方向）后，按 ``evaluate`` 的算法重算全树线段电流与
+    节点电压。越限判定沿用 ``evaluate`` 的额定电流、节点最低允许电压（含节点级
+    覆盖）与 EPS 容差规则；无越限即视为可恢复。最终从可恢复候选中选取最低节点
+    电压余量（全树节点 电压 - 生效阈值 的最小值）最大的方案，余量在 EPS 内视为
+    平局并按输入顺序；无可恢复方案时选中项为 None。
+    """
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    seg_by_id = {seg.id: seg for seg in tree.segments}
+    if fault_segment_id not in seg_by_id:
+        raise InputValidationError("故障线段无效", [f"故障线段 '{fault_segment_id}' 不存在于树中"])
+    fault_seg = seg_by_id[fault_segment_id]
+
+    # 失电分量：故障线段子节点以下的子树
+    outage_nodes: set[str] = set()
+    stack = [fault_seg.child]
+    while stack:
+        node = stack.pop()
+        outage_nodes.add(node)
+        for seg in tree.children_map.get(node, []):
+            stack.append(seg.child)
+    all_nodes = set(tree.parent_of) | {ROOT_NODE}
+    source_nodes = all_nodes - outage_nodes
+
+    # 候选跨接线校验：id 全局唯一；供电侧节点须在 source 所在分量，失电侧节点须在失电分量
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+    for t in tie_lines_in:
+        if t.id in seg_by_id or t.id in seen_ids:
+            errors.append(f"跨接线 id 重复: '{t.id}'")
+        seen_ids.add(t.id)
+        if t.from_node not in all_nodes:
+            errors.append(f"跨接线 '{t.id}' 的供电侧节点 '{t.from_node}' 不存在于树中")
+        elif t.from_node in outage_nodes:
+            errors.append(
+                f"跨接线 '{t.id}' 的供电侧节点 '{t.from_node}' 位于失电分量，"
+                f"须位于 '{ROOT_NODE}' 所在分量"
+            )
+        if t.to_node not in all_nodes:
+            errors.append(f"跨接线 '{t.id}' 的失电侧节点 '{t.to_node}' 不存在于树中")
+        elif t.to_node in source_nodes:
+            errors.append(f"跨接线 '{t.id}' 的失电侧节点 '{t.to_node}' 不在失电分量中")
+    if errors:
+        raise InputValidationError("候选跨接线定义无效", errors)
+
+    # 失电分量内部线段的无向邻接（不含故障线段），用于从接入点重新定向
+    undirected: dict[str, list[tuple[str, Segment]]] = {}
+    for seg in tree.segments:
+        if seg.id == fault_segment_id or seg.child not in outage_nodes:
+            continue
+        undirected.setdefault(seg.parent, []).append((seg.child, seg))
+        undirected.setdefault(seg.child, []).append((seg.parent, seg))
+
+    candidates = []
+    raw_margins: list[float] = []
+    for t in tie_lines_in:
+        # 失电分量从接入点重新定向（BFS，各边方向背向接入点）
+        reoriented: dict[str, Segment] = {}
+        visited = {t.to_node}
+        queue: deque[str] = deque([t.to_node])
+        while queue:
+            node = queue.popleft()
+            for neighbor, seg in undirected.get(node, []):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                reoriented[seg.id] = Segment(
+                    id=seg.id,
+                    parent=node,
+                    child=neighbor,
+                    resistance=seg.resistance,
+                    rated_current=seg.rated_current,
+                )
+                queue.append(neighbor)
+
+        # 新树线段：source 侧分量线段保持原方向与输入顺序，失电分量换为重新
+        # 定向后的线段，末尾追加跨接线
+        new_segments: list[Segment] = []
+        for seg in tree.segments:
+            if seg.id == fault_segment_id:
+                continue
+            new_segments.append(reoriented.get(seg.id, seg))
+        new_segments.append(
+            Segment(
+                id=t.id,
+                parent=t.from_node,
+                child=t.to_node,
+                resistance=t.resistance,
+                rated_current=t.rated_current,
+            )
+        )
+
+        new_tree = _prepare_tree(source_voltage, new_segments, loads_in)
+        over_current_segments, under_voltage_nodes = _find_violations(new_tree, min_voltage)
+        margin = min(
+            new_tree.node_voltage[node] - _node_threshold(new_tree, node, min_voltage)
+            for node in new_tree.order
+        )
+        raw_margins.append(margin)
+        candidates.append(
+            {
+                "tie_line_id": t.id,
+                "from_node": t.from_node,
+                "to_node": t.to_node,
+                "restorable": not over_current_segments and not under_voltage_nodes,
+                "min_voltage_margin": _round(margin),
+                "segments": _segment_results(new_tree),
+                "nodes": _node_results(new_tree, min_voltage),
+                "over_current_segments": over_current_segments,
+                "under_voltage_nodes": under_voltage_nodes,
+            }
+        )
+
+    # 从可恢复候选中选取最低节点电压余量最大者（EPS 内视为平局，按输入顺序）
+    selected_tie_line_id: Optional[str] = None
+    best_margin = 0.0
+    for index, candidate in enumerate(candidates):
+        if not candidate["restorable"]:
+            continue
+        if selected_tie_line_id is None or raw_margins[index] > best_margin + EPS:
+            selected_tie_line_id = candidate["tie_line_id"]
+            best_margin = raw_margins[index]
+
+    return {
+        "fault_segment_id": fault_segment_id,
+        "candidates": candidates,
+        "selected_tie_line_id": selected_tie_line_id,
     }

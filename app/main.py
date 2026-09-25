@@ -11,6 +11,7 @@ from .core import (
     InputValidationError,
     capacity,
     evaluate,
+    outage_restoration,
     peak_risk,
     unregistered_load,
 )
@@ -19,6 +20,8 @@ from .models import (
     CapacityResponse,
     EvaluateRequest,
     EvaluateResponse,
+    OutageRestorationRequest,
+    OutageRestorationResponse,
     PeakRiskRequest,
     PeakRiskResponse,
     UnregisteredLoadRequest,
@@ -32,9 +35,10 @@ app = FastAPI(
         "自叶向根累计各段电流，自根向叶计算压降与节点电压，"
         "返回超额定电流与欠压位置；并可评估指定节点可追加的最大恒定负载电流，"
         "根据线段实测电流定位唯一未登记正恒定负载的候选节点，"
-        "或评估至多 K 条负载同时升至峰值时的最坏越限风险。"
+        "评估至多 K 条负载同时升至峰值时的最坏越限风险，"
+        "或在故障线段断开后评估候选跨接线的恢复方案并选出最优者。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -60,12 +64,23 @@ _FIELD_LABELS = {
     "segment_id": "线段标识",
     "peak_current": "峰值电流",
     "max_simultaneous_peaks": "最大同时峰值数",
+    "fault_segment_id": "故障线段标识",
+    "tie_lines": "跨接线列表",
 }
 
 # measurements 内字段的中文标签（与负载字段同名时区分为“实测”）
 _MEASUREMENT_FIELD_LABELS = {
     "current": "实测电流",
     "segment_id": "测点线段标识",
+}
+
+# tie_lines 内字段的中文标签（与线段字段同名时区分为“跨接线”）
+_TIE_LINE_FIELD_LABELS = {
+    "id": "跨接线标识",
+    "from_node": "供电侧节点",
+    "to_node": "失电侧节点",
+    "resistance": "跨接线电阻",
+    "rated_current": "跨接线额定电流",
 }
 
 _CUSTOM_MESSAGES = {
@@ -83,14 +98,17 @@ def _translate_error(err: dict) -> dict:
     loc = [str(x) for x in err.get("loc", []) if x != "body"]
     field = loc[-1] if loc else ""
     in_measurements = "measurements" in loc
+    in_tie_lines = "tie_lines" in loc
     if in_measurements:
         label = _MEASUREMENT_FIELD_LABELS.get(field, field or "请求体")
+    elif in_tie_lines:
+        label = _TIE_LINE_FIELD_LABELS.get(field, field or "请求体")
     else:
         label = _FIELD_LABELS.get(field, field or "请求体")
     err_type = err.get("type", "")
     ctx = err.get("ctx", {})
 
-    custom = _CUSTOM_MESSAGES.get((field, err_type)) if not in_measurements else None
+    custom = _CUSTOM_MESSAGES.get((field, err_type)) if not (in_measurements or in_tie_lines) else None
     if custom:
         message = custom
     elif err_type == "missing":
@@ -201,6 +219,22 @@ def peak_risk_endpoint(payload: PeakRiskRequest) -> dict:
     )
 
 
+@app.post(
+    "/outage-restoration",
+    response_model=OutageRestorationResponse,
+    summary="故障段断开后评估候选跨接线恢复方案并选出最优者",
+)
+def outage_restoration_endpoint(payload: OutageRestorationRequest) -> dict:
+    return outage_restoration(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        fault_segment_id=payload.fault_segment_id,
+        tie_lines_in=payload.tie_lines,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -214,6 +248,7 @@ def index() -> dict:
         "capacity": "POST /capacity",
         "unregistered_load": "POST /unregistered-load",
         "peak_risk": "POST /peak-risk",
+        "outage_restoration": "POST /outage-restoration",
         "docs": "/docs",
         "health": "/health",
     }

@@ -208,3 +208,50 @@ class PeakRiskResponse(BaseModel):
     under_voltage_nodes: list[PeakUnderVoltageViolation] = Field(
         description="最坏情况下欠压的节点"
     )
+
+
+class TieLineInput(BaseModel):
+    """一条候选跨接线：恢复供电时电流自供电侧节点流向失电侧节点。"""
+
+    id: str = Field(min_length=1, description="跨接线标识，须与已有线段及其他候选跨接线不重复")
+    from_node: str = Field(min_length=1, description="供电侧节点，须位于 source 所在分量")
+    to_node: str = Field(
+        min_length=1, description="失电侧节点（接入点），须位于失电分量，可为分量内任意节点"
+    )
+    resistance: float = Field(ge=0, description="跨接线电阻 (Ω)，不允许为负")
+    rated_current: float = Field(gt=0, description="跨接线额定电流 (A)，必须为正")
+
+
+class OutageRestorationRequest(EvaluateRequest):
+    """故障恢复评估请求：在 /evaluate 参数基础上指定故障线段与候选跨接线。"""
+
+    fault_segment_id: str = Field(min_length=1, description="故障线段标识，须存在于树中")
+    tie_lines: list[TieLineInput] = Field(
+        default_factory=list, description="候选跨接线列表，按输入顺序逐条评估"
+    )
+
+
+class TieLineResult(BaseModel):
+    tie_line_id: str = Field(description="候选跨接线标识")
+    from_node: str = Field(description="供电侧节点")
+    to_node: str = Field(description="失电侧节点（接入点）")
+    restorable: bool = Field(description="接入后全树无超额定电流且无欠压时为 true")
+    min_voltage_margin: float = Field(
+        description="全树节点 电压 - 生效最低允许电压 的最小值 (V)，展示值按 6 位小数舍入"
+    )
+    segments: list[SegmentResult] = Field(
+        description="失电分量重新定向并重算后的全树线段（含跨接线，不含故障线段）"
+    )
+    nodes: list[NodeResult] = Field(description="重算后的全树节点电压")
+    over_current_segments: list[OverCurrentViolation] = Field(description="接入后超额定电流的线段")
+    under_voltage_nodes: list[UnderVoltageViolation] = Field(description="接入后欠压的节点")
+
+
+class OutageRestorationResponse(BaseModel):
+    fault_segment_id: str = Field(description="被断开的故障线段标识")
+    candidates: list[TieLineResult] = Field(description="各候选跨接线的评估结果，按输入顺序")
+    selected_tie_line_id: Optional[str] = Field(
+        default=None,
+        description="选中的跨接线标识：可恢复候选中最低节点电压余量最大者（平局按输入顺序）；"
+        "无可恢复方案时为 null",
+    )
